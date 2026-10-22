@@ -23,6 +23,8 @@ import { astroResolver } from './astro';
 import { djangoResolver, flaskResolver, fastapiResolver } from './python';
 import { railsResolver } from './ruby';
 import { springResolver } from './java';
+import { strutsResolver } from './struts';
+import { jpaResolver } from './jpa';
 import { playResolver } from './play';
 import { goResolver } from './go';
 import { goframeResolver } from './goframe';
@@ -72,6 +74,12 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   railsResolver,
   // Java
   springResolver,
+  // Struts 1/2 — struts.xml / struts-config.xml `<action>` routes bound to
+  // their Java handler methods; struts2-convention-plugin `@Action` routes
+  strutsResolver,
+  // JPA — `jpa:entity:`/`jpa:repository:` connector nodes carrying the
+  // entity-relation map and Spring Data repository → entity bindings
+  jpaResolver,
   playResolver,
   // Go
   goResolver,
@@ -192,6 +200,8 @@ export { astroResolver } from './astro';
 export { djangoResolver, flaskResolver, fastapiResolver } from './python';
 export { railsResolver } from './ruby';
 export { springResolver } from './java';
+export { strutsResolver } from './struts';
+export { jpaResolver } from './jpa';
 export { playResolver } from './play';
 export { goResolver } from './go';
 export { goframeResolver } from './goframe';

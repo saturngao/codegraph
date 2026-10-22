@@ -9,7 +9,7 @@ import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSupertypeTarget, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
-import { JS_ARRAY_METHODS, JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
+import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, inSameDartLibrary } from './dart-libraries';
 import { isDartLocallyBound } from './dart-local-scope';
@@ -1367,13 +1367,6 @@ function lexicalScopeOf(candidate: Node, context: ResolutionContext): { start: n
 const ESM_FAMILY = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx', 'arkts']);
 
 /**
- * The ES-module family with single-file components' script blocks: a file
- * declaring the class an import names (tsImportedTypeFile) is the same
- * signal in each.
- */
-const ES_IMPORT_LANGUAGES = new Set<string>([...ESM_FAMILY, 'vue', 'svelte', 'astro']);
-
-/**
  * A line-initial `import` statement — the marker that a JS/TS file is a MODULE
  * rather than a classic script. Line-anchored and followed by a name, brace,
  * star or quote, so a dynamic `import(` and the word inside a comment or string
@@ -2366,15 +2359,6 @@ function goLocalDecl(name: string, ref: UnresolvedRef, context: ResolutionContex
   return found?.[2];
 }
 
-/**
- * Whether a Go reference's name is a parameter or local of the function
- * around it, which shadows every declaration of its package: client-go's
- * `init := func(t *testing.T) {…}` then `init(t)`.
- */
-export function isGoLocallyBound(ref: UnresolvedRef, context: ResolutionContext): boolean {
-  return goLocalDecl(ref.referenceName, ref, context) !== undefined;
-}
-
 function goScopeIndex(filePath: string, context: ResolutionContext): GoScopeIndex | null {
   let memo = GO_SCOPE_INDEXES.get(context);
   if (!memo) GO_SCOPE_INDEXES.set(context, (memo = new Map()));
@@ -2948,16 +2932,6 @@ function isSfcPrivate(n: Node, context: ResolutionContext): boolean {
 }
 
 /**
- * Whether Go lets `ref`'s file name the Go declaration `candidate`: an
- * exported name from anywhere, an unexported one only inside its own package,
- * which is a directory. By the name's first letter, not the extractor's flag:
- * the flag is unset for every Go method, exported or not.
- */
-function isGoNameVisible(candidate: Node, ref: UnresolvedRef): boolean {
-  return /^[A-Z]/.test(candidate.name) || path.posix.dirname(candidate.filePath) === path.posix.dirname(ref.filePath);
-}
-
-/**
  * Whether `candidate` can be NAMED from a reference in `ref`'s file at all,
  * given what its language says about the definition's visibility. A
  * definition the language makes file-local is not a candidate for a
@@ -3041,7 +3015,11 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
         !cppIncluders(candidate.filePath, context).has(ref.filePath)) return false;
     return !isCppTranslationUnitLocal(candidate, ref, context);
   }
-  if (lang === 'go') return isGoNameVisible(candidate, ref);
+  if (lang === 'go') {
+    // By the name's first letter, not the extractor's flag: the flag is unset
+    // for every Go method, exported or not.
+    return /^[A-Z]/.test(candidate.name) || path.posix.dirname(candidate.filePath) === path.posix.dirname(ref.filePath);
+  }
   if (lang === 'rust') {
     if (candidate.visibility !== 'private') return true;
     if (isRustTraitImplMethod(candidate, context)) return true;
@@ -7968,10 +7946,6 @@ export function matchByExactName(
     // Likewise a bare Java type name: retrofit's tests' `new Builder()` is not
     // a wire converter test's nested `CrashingPhone.Builder`.
     isJavaTypeVisible(n, ref, context) &&
-    // And a Go name that isn't exported, only its own package's: prometheus
-    // tsdb's `[]*memSeries` is head.go's, not `tsdb/agent`'s, which scored the
-    // same (a child package's directory shares as much of the path) and won.
-    (n.language !== 'go' || isGoNameVisible(n, ref)) &&
     dartExtensionDecl(n, context)?.named !== false &&
     // A Scala package object's member, only where it is in scope — ahead of
     // the ranking, so cats.laws' `Eq` can be the `cats` package object's.
@@ -8985,10 +8959,6 @@ export function resolveMethodOnType(
    * signal Java imports carry but the call site doesn't (#314).
    * For Go it is the project-relative directory of the package that
    * declares `typeName`, when that is known (resolveGoMethodInPackage).
-   * For TS/JS it is the file declaring the class the caller's file
-   * imports under that name (tsImportedTypeFile), or, for a type written
-   * in another file (an imported value's), the class that file imports or
-   * declares.
    */
   preferredFqn?: string,
   /** Recursion guard for the supertype/conformance walk. */
@@ -9054,11 +9024,7 @@ export function resolveMethodOnType(
     return null;
   }
 
-  if (matches.length > 1 && preferredFqn && ES_IMPORT_LANGUAGES.has(ref.language)) {
-    const chosen = matches.find((m) => m.filePath === preferredFqn);
-    if (chosen) return { original: ref, targetNodeId: chosen.id, confidence, resolvedBy };
-  }
-  if (matches.length > 1 && preferredFqn && ref.language !== 'go' && !ES_IMPORT_LANGUAGES.has(ref.language)) {
+  if (matches.length > 1 && preferredFqn && ref.language !== 'go') {
     const ext = ref.language === 'kotlin' ? '.kt' : '.java';
     const fqnPath = preferredFqn.replace(/\./g, '/') + ext;
     const chosen = matches.find((m) => {
@@ -9081,9 +9047,9 @@ export function resolveMethodOnType(
   // the definition in the CALL SITE's own file. Without this, every ambiguous
   // call collapses onto the first-indexed definition, so a call in `b/svc.cpp`
   // wrongly points at `a/svc.cpp` (#1079). This runs AFTER the `preferredFqn`
-  // blocks, so Java/Kotlin and TS/JS import disambiguation — whose target is
-  // intentionally in ANOTHER file (#314) — is unaffected: those blocks return
-  // early whenever an import pins the class.
+  // block, so Java/Kotlin import disambiguation — whose target is intentionally
+  // in ANOTHER file (#314) — is unaffected: that block returns early whenever
+  // an import FQN pins the class.
   if (ref.referenceKind === 'function_ref' && matches.length !== 1) return null;
   const ordered = preferCallSiteFile(cppVisibleFirst(matches, ref, context), ref.filePath);
   return {
@@ -12790,42 +12756,6 @@ function importedFqnOf(
   return imports.find((i) => i.localName === typeName)?.source;
 }
 
-/** Per-context memo: `<file>\0<type name as written>` → tsImportedTypeFile's answer. */
-const TS_IMPORTED_TYPE_FILES = new WeakMap<ResolutionContext, Map<string, string | null>>();
-
-/**
- * The file declaring the type a TS/JS file imports under the name a
- * declaration in it writes (`store: DisposableStore`, `new async.Delayer()`),
- * or undefined when the file doesn't import that name. Several classes may
- * share it, a vendored copy, a test fixture or another app's, and the import
- * is what says which one the file means: on vscode, calls on a
- * `DisposableStore` imported from `vs/base/common/lifecycle` reached
- * copilot's vendored copy of that file, the first declaration indexed, and
- * a call whose first declaration was a test fixture's linked to nothing.
- */
-export function tsImportedTypeFile(written: string, ref: UnresolvedRef, context: ResolutionContext): string | undefined {
-  const name = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*/.exec(written.trim())?.[0];
-  if (!name) return undefined;
-  let memo = TS_IMPORTED_TYPE_FILES.get(context);
-  if (!memo) {
-    memo = new Map();
-    TS_IMPORTED_TYPE_FILES.set(context, memo);
-  }
-  const key = ref.filePath + '\0' + name;
-  let file = memo.get(key);
-  if (file === undefined) {
-    file = null;
-    const binding = name.split('.')[0]!;
-    if (context.getImportMappings?.(ref.filePath, ref.language)?.some((i) => i.localName === binding)) {
-      const imported = context.resolveImport?.({ ...ref, referenceName: name, referenceKind: 'references' });
-      const node = imported ? context.getNodeById?.(imported.targetNodeId) : undefined;
-      if (node && node.kind !== 'file' && node.filePath !== ref.filePath) file = node.filePath;
-    }
-    memo.set(key, file);
-  }
-  return file ?? undefined;
-}
-
 /**
  * Java/Kotlin: infer a receiver's declared type by walking field declarations
  * in the class enclosing the call site. The field's `signature` is already in
@@ -12917,11 +12847,6 @@ export function normalizeInferredTypeName(raw: string): string | null {
   return seg;
 }
 
-/** The element type of an array type a TS annotation gave (`Item[]`, `Item []` → `Item`), or undefined. */
-export function arrayElementType(type: string): string | undefined {
-  return /^(.+?)\s*\[\s*\]$/.exec(type)?.[1];
-}
-
 /**
  * A Java / C# type's optional type arguments (one level of nesting) and array
  * ranks, as a regex source: `<L, R>`, `<string, List<int>>`, `[]`, `[,]`.
@@ -12994,9 +12919,6 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   PYTHON_IMPORTED_FILES.delete(context);
   AWAITED_TYPE_MEMO.delete(context);
   AWAITED_FILES.delete(context);
-  TS_IMPORTED_TYPE_FILES.delete(context);
-  TS_NAMED_CLASSES.delete(context);
-  TS_AMBIENT_MODULE_FILES.delete(context);
   C_STATIC_MEMO.delete(context);
   CPP_TYPE_DECLS.delete(context);
   CPP_INCLUDE_LINES.delete(context);
@@ -13104,9 +13026,6 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   JS_FN_CODE.delete(context);
   TS_FIELD_DECL_MEMO.delete(context);
   TS_CLASS_LINES.delete(context);
-  TS_PASS_THROUGH_WRAPPERS.delete(context);
-  TS_CREATE_INSTANCE_DECLARED.delete(context);
-  TS_NAMED_TYPES.delete(context);
   TARGET_LANGUAGE.delete(context);
 }
 
@@ -13135,15 +13054,6 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
     case 'arkts':
       return [
         new RegExp(`\\b${r}\\b\\s*=\\s*new\\s+([A-Za-z_$][\\w.$]*)`), // = new Logger()
-        // = inject(Logger) / = this.instantiationService.createInstance(Logger, …):
-        // a dependency-injection call that hands back an instance of the class
-        // it is given — unless a member of it is taken (`createInstance(
-        // TestServiceAccessor).filesConfigurationService`). A key that isn't a
-        // class (Vue's `inject(KEY)`) names no type with the method, so it
-        // links nothing.
-        // A type argument is the type returned: `inject<Params>(DIALOG_DATA)`.
-        new RegExp(`\\b${r}\\b\\s*=\\s*(?:inject|(?:this\\.)?(?:[\\w$#]+\\.)*createInstance)\\s*<\\s*([A-Z][\\w.$]*)[^;=(){}]*>\\s*\\((?![^;]*\\)\\s*(?:\\?\\.|\\.|\\[))`),
-        new RegExp(`\\b${r}\\b\\s*=\\s*(?:inject|(?:this\\.)?(?:[\\w$#]+\\.)*createInstance)\\s*\\(\\s*([A-Z][\\w.$]*)(?![^;]*\\)\\s*(?:\\?\\.|\\.|\\[))`),
         // No keyword requirement, so this matches BOTH a local annotation
         // (`const lg: Logger`) and a typed parameter (`function use(lg: Logger)`
         // / `(lg: Logger) =>`) — the parameter case the old `const|let|var`
@@ -13151,11 +13061,7 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
         // at `<` so a generic-typed param (`repo: Repository<User>`) still yields
         // `Repository`. resolveMethodOnType validates the type actually declares
         // the method, so the looser match produces no edge on a mis-inference.
-        // A type followed by brackets is captured whole, so matchMethodCall
-        // can tell an array of it (`items: Item[]`, `items: Item<K>[]`), whose
-        // own methods aren't an element's (arrayElementType), from one of its
-        // properties (`groupIds: Element["groupIds"]`), which isn't it.
-        new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.$]*(?:(?:\\s*<[^;=(){}<>]*(?:<[^;=(){}<>]*>[^;=(){}<>]*)*>)?\\s*\\[[^\\]]*\\])?)`), // lg: Logger  (annotation or typed param)
+        new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.$]*)`), // lg: Logger  (annotation or typed param)
       ];
     case 'python':
       return [
@@ -13497,35 +13403,10 @@ function readDeclaredSupertypes(cls: Node, context: ResolutionContext): string[]
     case 'pascal': return names(/=\s*class\s*\(([^)]*)\)/i.exec(head)?.[1]);
     case 'python': return names(/\bclass\s+\w+\s*\(([^)]*)\)/.exec(head)?.[1]?.replace(/\w+\s*=\s*[\w.]+/g, ''));
     case 'ruby': return names(/\bclass\s+[\w:]+\s*<\s*([\w:]+)/.exec(head)?.[1]);
-    case 'php': return names(/\bextends\s+([\w.\\]+)/.exec(head)?.[1]);
-    case 'typescript': case 'tsx': case 'javascript': case 'jsx':
-      return names(/\bextends\s+([\w.\\]+)/.exec(tsClassHead(lines, cls))?.[1]);
+    case 'php': case 'typescript': case 'tsx': case 'javascript': case 'jsx':
+      return names(/\bextends\s+([\w.\\]+)/.exec(head)?.[1]);
     default: return [];
   }
-}
-
-/**
- * A TS/JS class's (or interface's) head, from its `class` keyword to its
- * body, with type parameter lists and type arguments left out: the first
- * `extends` in `class EditorPane<M extends object = object> extends
- * Composite<M>` is a constraint, not the class it extends. Decorators above
- * the keyword are skipped, and the head may run over several lines.
- */
-function tsClassHead(lines: readonly string[], cls: Node): string {
-  const text = lines.slice(cls.startLine - 1, cls.startLine + 7).join(' ');
-  const named = new RegExp(`\\b(?:class|interface)\\s+${cls.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).exec(text);
-  let head = '';
-  let angles = 0;
-  for (let i = named?.index ?? /\bclass\b/.exec(text)?.index ?? 0; i < text.length; i++) {
-    const c = text[i]!;
-    if (c === '<') angles++;
-    else if (c === '>' && angles > 0 && text[i - 1] !== '=') angles--;
-    else if (angles === 0) {
-      if (c === '{') break;
-      head += c;
-    }
-  }
-  return head;
 }
 
 /** A method named `name` on a supertype of the given classes, nearest first. */
@@ -13703,7 +13584,7 @@ function enclosingScopeStartLine(ref: UnresolvedRef, context: ResolutionContext)
  * without patterns or when no declaration is found. Bounded to the enclosing
  * scope so a same-named variable in another function can't leak in.
  */
-export function inferLocalReceiverType(
+function inferLocalReceiverType(
   receiverName: string,
   ref: UnresolvedRef,
   context: ResolutionContext,
@@ -14156,11 +14037,7 @@ export function matchMethodCall(
   // operator form requires at least one non-word char after `operator`, and
   // every downstream strategy compares the method part by exact string
   // equality, so a stray match can't invent an edge.
-  // A JS/TS method name may carry `$`, which `\w` doesn't: an RxJS-style
-  // `this.organizationService.organizations$()`, vscode's RPC
-  // `this._proxy.$acceptModelChanged()`.
   const dotMatch =
-    (JS_FAMILY.has(ref.language) ? ref.referenceName.match(/^([\w.]+)\.([\w$]+)$/) : null) ??
     ref.referenceName.match(/^([\w.]+)\.(\w+:?(?:\w+:)*)$/) ??
     (ref.language === 'cpp'
       ? ref.referenceName.match(/^([\w.]+)\.(operator[^\w\s.]+)$/)
@@ -14325,41 +14202,6 @@ export function matchMethodCall(
       if (!awaited.name || TS_PRIMITIVE_TYPES.has(awaited.name)) return null;
       inferredType = awaited.name;
     }
-    // A TS annotation with brackets after the type. An array of it (`items:
-    // Item[]`): a method arrays have is the array's, which no project class
-    // declares, where `distinctElements.find(…)` on vscode's `ExplorerItem[]`
-    // reached `ExplorerItem.find`; any other is called on one of its elements
-    // under the same name, as in `d.forEach(d => d.dispose())`, so it takes
-    // the element's type. One of a type's properties (`editor:
-    // IChatWidget['inputEditor']`) has the type that property is declared
-    // with, an array of it the same way, where the type it indexes reached
-    // vscode's `ISessionChatPillVisibilityService.isVisible` through
-    // `['pullRequests']`. That type decides alone, as a `this.<field>`
-    // call's does (matchTsThisFieldCall): the method is its, or nothing the
-    // method's name would guess. Its class is the one the declaring file
-    // imports, as a typed local's is the one the call's file imports:
-    // vscode's `ComponentFixtureContext['disposableStore']` reached
-    // copilot's vendored `DisposableStore`. A property whose type isn't
-    // written there (a getter like `Emitter`'s `event`, `typeof`), or a key
-    // that isn't a name (`Parameters<typeof f>[0]`), says nothing new, and
-    // is read as the type it indexes, as before: the nearest line declaring
-    // the name may be another variable's type's member, as vscode's `let
-    // mockPty: { onCommandExecuted: Emitter<E>['event'] }` is above calls on
-    // the local `onCommandExecuted`, an `Emitter<E>`.
-    if (inferredType && ESM_FAMILY.has(ref.language) && inferredType.endsWith(']')) {
-      const element = arrayElementType(inferredType);
-      const declared = element !== undefined
-        ? { type: element, array: true, file: undefined }
-        : tsIndexedPropertyType(inferredType, ref, context);
-      if (!declared) {
-        inferredType = inferredType.replace(/\s*\[[^\]]*\]$/, '');
-      } else {
-        if (declared.array && JS_ARRAY_METHODS.has(methodName!)) return null;
-        inferredType = normalizeInferredTypeName(declared.type);
-        if (!inferredType) return null;
-        if (element === undefined) return resolveMethodOnType(inferredType, methodName!, ref, context, 0.9, 'instance-method', declared.file);
-      }
-    }
     if (inferredType) {
       // A Go local bound from a type assertion calls a method of the type Go
       // finds for it, or nothing the project declares: `flusher.Flush()` after
@@ -14368,36 +14210,16 @@ export function matchMethodCall(
         return decl.asserted && resolveMethodOnType(decl.asserted.name, methodName!, ref, context, 0.9, 'instance-method', decl.asserted.dir);
       }
       // Java/Kotlin: when two classes share the simple name, the file's import
-      // pins WHICH one (#314); Go: the package that declares the type (#2323);
-      // TS/JS: the file declaring the class the file imports under that name.
+      // pins WHICH one (#314); Go: the package that declares the type (#2323).
       // Other languages disambiguate by call-site file.
-      let importedFqn =
+      const importedFqn =
         ref.language === 'java' || ref.language === 'kotlin'
           ? context
               .getImportMappings(ref.filePath, ref.language)
               .find((i) => i.localName === inferredType)?.source
           : ref.language === 'go'
             ? goDeclaredTypePackage(decl.raw, ref.filePath, context)
-            : ESM_FAMILY.has(ref.language) && !awaited
-              ? nmTimedT('mc-tsimport', ref, () => tsImportedTypeFile(decl.raw ?? inferredType!, ref, context))
-              : undefined;
-      // A TS/JS type the file imports from a package outside the project has
-      // no project method, whatever project class shares its name, unless a
-      // project file declares the package (tsOutsideTypeDeclaration).
-      if (ESM_FAMILY.has(ref.language) && !awaited && importedFqn === undefined) {
-        const outside = nmTimedT('mc-tsoutside', ref, () => tsOutsideTypeDeclaration(decl.raw ?? inferredType!, inferredType!, ref, context));
-        if (outside === null) return null;
-        importedFqn = outside;
-      }
-      // The class the file names, through its own supertypes
-      // (tsKnownTypeCall), before any same-named class elsewhere. Only a
-      // method found counts: a local's type is read by an unscoped scan
-      // that can find another function's `agent: IAgent`, so one without
-      // the method mustn't rule out what follows, as a field's does.
-      if (ESM_FAMILY.has(ref.language) && !awaited) {
-        const known = tsKnownTypeCall(inferredType, importedFqn ?? ref.filePath, methodName!, ref, ref, context, 0.9);
-        if (known) return known;
-      }
+            : undefined;
       const typedMatch = nmTimedT('mc-rmot', ref, () => resolveMethodOnType(
         inferredType,
         methodName!,
@@ -15663,39 +15485,13 @@ function matchRustSelfFieldCall(
 /**
  * Per-context memo for matchTsThisFieldCall's declaration scan: `classId\0field`
  * → the first line of the class that declares the field (as `: typeof X`,
- * `: X`, `= new X`, or `= this.<wrapper>(new X`, tried in that order per
- * line) with its captured type, or null. The scan depends only on the class
- * and the field, but ran for every `this.<field>.<method>()` call —
- * re-splitting the file and compiling three patterns each time, a third of
- * all method-call matching on vscode. Derived from file source: drops with
- * clearNameMatcherMemos.
+ * `: X`, or `= new X`, tried in that order per line) with its captured type,
+ * or null. The scan depends only on the class and the field, but ran for every
+ * `this.<field>.<method>()` call — re-splitting the file and compiling three
+ * patterns each time, a third of all method-call matching on vscode. Derived
+ * from file source: drops with clearNameMatcherMemos.
  */
-const TS_FIELD_DECL_MEMO = new WeakMap<ResolutionContext, Map<string, TsFieldDecl | null>>();
-/**
- * A TS field's declared type as tsFieldDeclaration reads it: the type it
- * names (`Mailer` of `mailer: Mailer<T>`), whether that is a value's
- * (`typeof X`), and whether the field holds an array of it (`items: Item[]`).
- */
-type TsFieldDecl = { valueType: boolean; type: string; array?: boolean };
-/**
- * The call an initializer hands `new X(…)` to: `this.<method>(…)`, or
- * `this.<holder>.<method>(…)` — vscode's `this._register(new Emitter())` and
- * `this._store.add(new Emitter())`.
- */
-type TsFieldWrapper = { holder?: string; method: string };
-/**
- * A dependency-injection call that hands back an instance of the class it
- * is given: Angular's `inject(X)`, vscode's `instantiationService
- * .createInstance(X, …)`.
- */
-type TsInjector = 'inject' | 'createInstance';
-/**
- * A declaration found on one line; a wrapped one names its wrapper, an
- * injected one its injector, and either where its call's `(` is.
- */
-type TsFieldOnLine = TsFieldDecl & { via?: TsFieldWrapper; injector?: TsInjector; open?: number };
-/** What follows a field's type when the field holds an array of it: `[]`, after any type arguments. */
-const TS_ARRAY_SUFFIX = /^\s*(?:<[^;=(){}<>]*(?:<[^;=(){}<>]*>[^;=(){}<>]*)*>)?\s*\[\s*\]/;
+const TS_FIELD_DECL_MEMO = new WeakMap<ResolutionContext, Map<string, { valueType: boolean; type: string } | null>>();
 /** A class's comment-stripped lines, and which of them hold each `[\w$#]` token. */
 interface TsClassDecl {
   lines: string[];
@@ -15740,36 +15536,16 @@ const TS_TOKEN_CHAR = /[\w$#]/;
  * token occurrence of the field. There the run consumes exactly the field (a
  * shorter prefix cannot continue: every pattern needs `\s`, `?`, `!`, `:` or
  * `=` next), so each matches exactly where the field's own pattern would —
- * without compiling four patterns for every field of every class.
+ * without compiling three patterns for every field of every class.
  */
 const TS_FIELD_PATTERNS_AT: readonly TsFieldPattern[] = [
   { re: /(?<![\w$#])[\w$#]+\b\s*[?!]?\s*:\s*(?:readonly\s+)?typeof\s+([A-Za-z_$][\w.$]*)/y, valueType: true },
   { re: /(?<![\w$#])[\w$#]+\b\s*[?!]?\s*:\s*(?:readonly\s+)?([A-Za-z_$][\w.$]*)/y, valueType: false },
   { re: /(?<![\w$#])[\w$#]+\b\s*=\s*new\s+([A-Za-z_$][\w.$]*)/y, valueType: false },
-  { re: /(?<![\w$#])[\w$#]+\b\s*=\s*this\.(?:([\w$#]+)\.)?([\w$#]+)\(\s*(?:new\s+|((?:this\.)?(?:[\w$#]+\.)*createInstance)\s*\(\s*)([A-Za-z_$][\w.$]*)/y, valueType: false, wrapped: true },
-  { re: /(?<![\w$#])[\w$#]+\b\s*=\s*(inject|(?:this\.)?(?:[\w$#]+\.)*createInstance)\s*(?:<\s*([A-Z][\w.$]*)[^;=(){}]*>)?\s*\(\s*([A-Z][\w.$]*)/y, valueType: false, injected: true },
 ];
 
-/** A declaration `pattern` matched (`m`) on `line`: its type, and its wrapper or injector when it has one. */
-function tsFieldMatch(pattern: TsFieldPattern, m: RegExpMatchArray, line: string): TsFieldOnLine | null {
-  // An injector's type argument is the type it returns: `inject<Params>(DIALOG_DATA)`.
-  const type = pattern.wrapped ? m[4] : pattern.injected ? m[2] ?? m[3] : m[1];
-  if (!type) return null;
-  const decl: TsFieldOnLine = { valueType: pattern.valueType, type, array: TS_ARRAY_SUFFIX.test(line.slice(m.index! + m[0].length)) };
-  if (pattern.wrapped) {
-    decl.via = { holder: m[1], method: m[2]! };
-    if (m[3]) decl.injector = 'createInstance';
-  } else if (pattern.injected) {
-    decl.injector = m[1] === 'inject' ? 'inject' : 'createInstance';
-  }
-  // The first `(` after the field is the wrapper's, or the injector's: a
-  // type argument list (`inject<Foo>(`) holds none.
-  if (pattern.wrapped || pattern.injected) decl.open = m.index! + m[0].indexOf('(');
-  return decl;
-}
-
 /** The first declaration of `field` on one line, as `line.match` of its patterns in order would find it. */
-function tsFieldOnLine(line: string, field: string): TsFieldOnLine | null {
+function tsFieldOnLine(line: string, field: string): { valueType: boolean; type: string } | null {
   let at: number[] | null = null;
   for (let i = line.indexOf(field); i !== -1; i = line.indexOf(field, i + 1)) {
     const end = i + field.length;
@@ -15777,12 +15553,11 @@ function tsFieldOnLine(line: string, field: string): TsFieldOnLine | null {
     (at ??= []).push(i);
   }
   if (!at) return null;
-  for (const pattern of TS_FIELD_PATTERNS_AT) {
+  for (const { re, valueType } of TS_FIELD_PATTERNS_AT) {
     for (const i of at) {
-      pattern.re.lastIndex = i;
-      const m = pattern.re.exec(line);
-      const decl = m && tsFieldMatch(pattern, m, line);
-      if (decl) return decl;
+      re.lastIndex = i;
+      const m = re.exec(line);
+      if (m && m[1]) return { valueType, type: m[1] };
     }
   }
   return null;
@@ -15804,12 +15579,7 @@ function tsClassLinesWithToken(decl: TsClassDecl, token: string): readonly numbe
   return decl.linesByToken.get(token) ?? [];
 }
 
-/**
- * A field declaration pattern. A wrapped one captures its wrapper's holder
- * and method, and an injector inside it, before the type; an injected one
- * its injector before the type.
- */
-type TsFieldPattern = { re: RegExp; valueType: boolean; wrapped?: true; injected?: true };
+type TsFieldPattern = { re: RegExp; valueType: boolean };
 /** Compiled declaration patterns by field name — fields recur across classes. */
 const TS_FIELD_PATTERNS = new Map<string, TsFieldPattern[]>();
 const TS_FIELD_PATTERNS_CAP = 4096;
@@ -15840,20 +15610,6 @@ function tsFieldPatterns(field: string): TsFieldPattern[] {
     },
     // `mailer = new Mailer()` / `this.mailer = new Mailer()`
     { re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*=\\s*new\\s+([A-Za-z_$][\\w.$]*)`), valueType: false },
-    // `_onDidChange = this._register(new Emitter())`, `x = this._store.add(new X())`:
-    // an X only when the wrapper returns its argument (tsFieldRead).
-    {
-      re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*=\\s*this\\.(?:([\\w$#]+)\\.)?([\\w$#]+)\\(\\s*(?:new\\s+|((?:this\\.)?(?:[\\w$#]+\\.)*createInstance)\\s*\\(\\s*)([A-Za-z_$][\\w.$]*)`),
-      valueType: false,
-      wrapped: true,
-    },
-    // `http = inject(HttpClient)`, `filter = this._instaService.createInstance(DocumentFilter)`:
-    // an X when the injector is one that hands back an instance (tsFieldRead).
-    {
-      re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*=\\s*(inject|(?:this\\.)?(?:[\\w$#]+\\.)*createInstance)\\s*(?:<\\s*([A-Z][\\w.$]*)[^;=(){}]*>)?\\s*\\(\\s*([A-Z][\\w.$]*)`),
-      valueType: false,
-      injected: true,
-    },
   ];
   if (TS_FIELD_PATTERNS.size >= TS_FIELD_PATTERNS_CAP) TS_FIELD_PATTERNS.delete(TS_FIELD_PATTERNS.keys().next().value!);
   TS_FIELD_PATTERNS.set(field, patterns);
@@ -15864,7 +15620,7 @@ function tsFieldDeclaration(
   cls: Node,
   field: string,
   context: ResolutionContext
-): TsFieldDecl | null {
+): { valueType: boolean; type: string } | null {
   let memo = TS_FIELD_DECL_MEMO.get(context);
   if (!memo) {
     memo = new Map();
@@ -15873,9 +15629,7 @@ function tsFieldDeclaration(
   const key = cls.id + '\0' + field;
   const hit = memo.get(key);
   if (hit !== undefined) return hit;
-  // Unread while it is being read: a wrapper's holder field can lead back here.
-  memo.set(key, null);
-  let found: TsFieldDecl | null = null;
+  let found: { valueType: boolean; type: string } | null = null;
   const decl = tsClassDecl(cls, context);
   if (decl && TS_FIELD_TOKEN.test(field)) {
     // Every pattern needs the field as a whole `[\w$#]` run — the lookbehind
@@ -15885,406 +15639,36 @@ function tsFieldDeclaration(
     const rows = ++decl.lookups > 1 ? tsClassLinesWithToken(decl, field) : null;
     const count = rows ? rows.length : decl.lines.length;
     for (let k = 0; k < count && !found; k++) {
-      const row = rows ? rows[k]! : k;
-      const line = decl.lines[row]!;
+      const line = decl.lines[rows ? rows[k]! : k]!;
       // Every pattern spells the field literally, so only a line that contains
       // it can match — and most of a class's lines never mention a given field.
-      if (line.includes(field)) found = tsFieldRead(tsFieldOnLine(line, field), cls, decl.lines, row, context);
+      if (line.includes(field)) found = tsFieldOnLine(line, field);
     }
   } else if (decl) {
     const patterns = tsFieldPatterns(field);
-    scan: for (let row = 0; row < decl.lines.length; row++) {
-      const line = decl.lines[row]!;
+    scan: for (const line of decl.lines) {
       if (!line.includes(field)) continue;
-      for (const pattern of patterns) {
-        const m = line.match(pattern.re);
-        const onLine = m && tsFieldMatch(pattern, m, line);
-        if (!onLine) continue;
-        found = tsFieldRead(onLine, cls, decl.lines, row, context);
-        if (found) break scan;
-        continue scan;
+      for (const { re, valueType } of patterns) {
+        const m = line.match(re);
+        if (!m || !m[1]) continue;
+        found = { valueType, type: m[1] };
+        break scan;
       }
     }
   }
   memo.set(key, found);
   return found;
-}
-
-/**
- * The declaration `onLine` reads, on line `row` of class `cls`'s `lines`. A
- * wrapped `new X(…)` is an X only when the wrapper's call ends the statement
- * and the wrapper's declaration returns its argument: `this._register(new
- * Emitter())` is an Emitter, but neither `this._register(new DomEmitter(el,
- * 'keydown')).event` nor what a wrapper declared `box<T>(value: T): Box<T>`
- * returns is. Otherwise the line declares nothing the reader can use, as
- * before.
- */
-function tsFieldRead(onLine: TsFieldOnLine | null, cls: Node, lines: readonly string[], row: number, context: ResolutionContext): TsFieldDecl | null {
-  if (!onLine?.via && !onLine?.injector) return onLine;
-  if (!tsCallEndsStatement(lines, row, onLine.open!)) return null;
-  if (onLine.via && !tsWrapperReturnsArgument(cls, onLine.via, context)) return null;
-  if (onLine.injector && !tsInjectsInstance(cls, onLine.injector, context)) return null;
-  return { valueType: onLine.valueType, type: onLine.type, array: onLine.array };
-}
-
-/** Per-context memo: does the project declare a `createInstance` that returns an instance of its constructor argument? */
-const TS_CREATE_INSTANCE_DECLARED = new WeakMap<ResolutionContext, boolean>();
-
-/**
- * Does `injector`, as class `cls`'s file calls it, hand back an instance of
- * the class it is given? Angular's `inject(X)` when the file imports
- * `inject` from `@angular/core` (Vue's `inject(key)` returns whatever was
- * provided under the key); `createInstance(X, …)` when the project declares
- * one that returns an `InstanceType` of its constructor argument, as
- * vscode's `IInstantiationService` does.
- */
-function tsInjectsInstance(cls: Node, injector: TsInjector, context: ResolutionContext): boolean {
-  if (injector === 'inject') {
-    return context.getImportMappings?.(cls.filePath, cls.language)?.some((i) => i.localName === 'inject' && i.source === '@angular/core') === true;
-  }
-  let declared = TS_CREATE_INSTANCE_DECLARED.get(context);
-  if (declared === undefined) {
-    declared = context.getNodesByName('createInstance').some((n) => {
-      if ((n.kind !== 'method' && n.kind !== 'function') || !ESM_FAMILY.has(n.language)) return false;
-      const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
-      return /\bInstanceType\s*</.test(lines.slice(n.startLine - 1, n.startLine + 2).join(' '));
-    });
-    TS_CREATE_INSTANCE_DECLARED.set(context, declared);
-  }
-  return declared;
-}
-
-/**
- * Does the call whose `(` is at `open` on `lines[row]` end its statement, so
- * that what it returns is what the statement assigns? Nothing but `;` (and
- * whatever follows it) may come after its `)`, nor start the next line —
- * `.event`, `?.x` or `[0]` would take a member of what it returns. Strings
- * are skipped; an unclosed one, or a call still open after 12 lines, isn't
- * read.
- */
-function tsCallEndsStatement(lines: readonly string[], row: number, open: number): boolean {
-  let depth = 0;
-  for (let r = row, from = open; r < lines.length && r < row + 12; r++, from = 0) {
-    const line = lines[r]!;
-    for (let i = from; i < line.length; i++) {
-      const c = line[i]!;
-      if (c === '"' || c === "'" || c === '`') {
-        let close = i + 1;
-        while (close < line.length && line[close] !== c) close += line[close] === '\\' ? 2 : 1;
-        if (close >= line.length) return false;
-        i = close;
-      } else if (c === '(') {
-        depth++;
-      } else if (c === ')' && --depth === 0) {
-        // Trimmed, not matched up to `$`: a CRLF checkout's lines keep their `\r`.
-        const rest = line.slice(i + 1).trim();
-        if (rest) return rest.startsWith(';');
-        const next = lines.slice(r + 1, r + 4).find((l) => l.trim());
-        return !next || !/^\s*(?:[.?[(!,:|&+*\/%<>=-]|as\b|satisfies\b)/.test(next);
-      }
-    }
-  }
-  return false;
-}
-
-/** Per-context memo: `<class id>\0<holder>\0<method>` → tsWrapperReturnsArgument's answer. */
-const TS_PASS_THROUGH_WRAPPERS = new WeakMap<ResolutionContext, Map<string, boolean>>();
-
-/**
- * Does the wrapper a field initializer of class `cls` calls return its
- * argument? `this.<method>` is the method `cls` declares or inherits, and
- * `this.<holder>.<method>` that method of the class the holder field is
- * declared as (its file imports or declares it). Each declaration of it that
- * the nearest declaring class has must be tsReturnsItsArgument.
- */
-function tsWrapperReturnsArgument(cls: Node, via: TsFieldWrapper, context: ResolutionContext): boolean {
-  let memo = TS_PASS_THROUGH_WRAPPERS.get(context);
-  if (!memo) {
-    memo = new Map();
-    TS_PASS_THROUGH_WRAPPERS.set(context, memo);
-  }
-  const key = `${cls.id}\0${via.holder ?? ''}\0${via.method}`;
-  const hit = memo.get(key);
-  if (hit !== undefined) return hit;
-  const at: UnresolvedRef = {
-    fromNodeId: cls.id, referenceName: via.method, referenceKind: 'calls',
-    line: cls.startLine, column: cls.startColumn, filePath: cls.filePath, language: cls.language,
-  };
-  const returns = nmTimedT('mc-thisfield-wrapper', at, () => {
-    let owner: Node | null = cls;
-    if (via.holder) {
-      const held = tsFieldThroughBases(cls, via.holder, at, context, 0);
-      owner = held && !held.decl.valueType && !held.decl.array ? tsNamedClass(held.decl.type, held.cls, at, context) : null;
-    }
-    const methods = owner ? tsClassMethods(owner, via.method, at, context, 0) : [];
-    return methods.length > 0 && methods.every((m) => tsReturnsItsArgument(m, context));
-  });
-  memo.set(key, returns);
-  return returns;
-}
-
-/**
- * How many classes up its `extends` chain a TS class's fields and wrapper
- * methods are looked for: vscode's editors declare emitters through
- * `_register`, which `Disposable` declares up to eight classes above them
- * (`… extends EditorPane extends Composite extends Component extends
- * Themable extends Disposable`).
- */
-const TS_BASE_WALK_DEPTH = 10;
-
-/**
- * The TS methods named `name` that class `cls` declares, or else the nearest
- * class it extends that declares one does (each base the class its
- * subclass's file names, as tsFieldThroughBases walks them).
- */
-function tsClassMethods(cls: Node, name: string, at: UnresolvedRef, context: ResolutionContext, depth: number): Node[] {
-  const own = context.getNodesInFile(cls.filePath).filter((n) =>
-    n.kind === 'method' && n.name === name && n.startLine >= cls.startLine && n.endLine <= cls.endLine &&
-    n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop() === cls.name);
-  if (own.length > 0 || depth >= TS_BASE_WALK_DEPTH) return own;
-  for (const sup of declaredSupertypes(cls, context)) {
-    const base = tsNamedClass(sup, cls, at, context);
-    if (!base || base.id === cls.id) continue;
-    const found = tsClassMethods(base, name, at, context, depth + 1);
-    if (found.length > 0) return found;
-  }
-  return [];
-}
-
-/** The kinds of node a TS/JS type name can name for a member call: classes and interfaces. */
-const TS_MEMBER_OWNER_KINDS = new Set<string>(['class', 'interface']);
-
-/** The class or interface named `name` that `file` declares. */
-function tsTypeDeclaredIn(file: string, name: string, context: ResolutionContext): Node | undefined {
-  return context.getNodesInFile(file).find((n) => n.name === name && TS_MEMBER_OWNER_KINDS.has(n.kind));
-}
-
-/**
- * The supertypes a TS/JS class or interface head names, as written
- * (`Disposable`, `lsp.Emitter`): what it extends (an interface may extend
- * several), then what it implements. Null when the head extends something
- * that isn't a name, like a mixin call.
- */
-function tsHeadSupertypes(cls: Node, context: ResolutionContext): string[] | null {
-  const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
-  const head = tsClassHead(lines, cls);
-  const out: string[] = [];
-  for (const keyword of ['extends', 'implements']) {
-    const clause = new RegExp(`\\b${keyword}\\b([\\s\\S]*?)(?:\\b(?:extends|implements)\\b|$)`).exec(head)?.[1];
-    if (clause === undefined) continue;
-    for (const part of clause.split(',')) {
-      const name = part.trim();
-      if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(name)) {
-        if (keyword === 'extends') return null;
-        continue;
-      }
-      out.push(name);
-    }
-  }
-  return out;
-}
-
-/** Per-context memo: `<file>\0<name as written>` → tsNamedType's answer. */
-const TS_NAMED_TYPES = new WeakMap<ResolutionContext, Map<string, Node | 'outside' | null>>();
-
-/**
- * The class or interface `written` names in `from`'s file: the one an import
- * leads to (aliases, re-exports, a namespace import's member), or one the
- * file declares. 'outside' when the file imports it from a package outside
- * the project that no project file declares; null when it can't be found.
- */
-function tsNamedType(
-  written: string,
-  from: Pick<Node, 'filePath' | 'language' | 'id'>,
-  at: UnresolvedRef,
-  context: ResolutionContext,
-): Node | 'outside' | null {
-  let memo = TS_NAMED_TYPES.get(context);
-  if (!memo) {
-    memo = new Map();
-    TS_NAMED_TYPES.set(context, memo);
-  }
-  const mapping = context.getImportMappings?.(from.filePath, from.language)?.find((i) => i.localName === written.split('.')[0]);
-  // A name the file declares is looked up past `from` itself.
-  const key = from.filePath + '\0' + written + (mapping ? '' : '\0' + from.id);
-  const hit = memo.get(key);
-  if (hit !== undefined) return hit;
-  const last = written.split('.').pop()!;
-  const ref: UnresolvedRef = { ...at, filePath: from.filePath, language: from.language };
-  let found: Node | 'outside' | null = null;
-  if (mapping && context.isOutOfRepoImport?.(mapping.source, from.filePath, from.language) === true) {
-    const ambient = tsOutsideTypeDeclaration(written, last, ref, context);
-    found = ambient === null ? 'outside' : ambient === undefined ? null : tsTypeDeclaredIn(ambient, last, context) ?? null;
-  } else if (mapping) {
-    const imported = context.resolveImport?.({ ...ref, referenceName: written, referenceKind: 'references' });
-    const node = imported ? context.getNodeById?.(imported.targetNodeId) : undefined;
-    // vscode's `ILogService` is also a constant, its dependency-injection
-    // decorator, which the import may name first: the type is the interface
-    // of that name beside it.
-    found = !node ? null : TS_MEMBER_OWNER_KINDS.has(node.kind) ? node : tsTypeDeclaredIn(node.filePath, node.name, context) ?? null;
-  } else if (!written.includes('.')) {
-    found = context.getNodesInFile(from.filePath).find((n) => n.id !== from.id && n.name === written && TS_MEMBER_OWNER_KINDS.has(n.kind)) ?? null;
-  }
-  memo.set(key, found);
-  return found;
-}
-
-/**
- * The method `name` of the TS/JS class or interface `cls`: its own, or else
- * the nearest supertype's up its head's `extends` (then `implements`), each
- * found the way its subtype's file names it (tsNamedType). `complete` when
- * every supertype was found in the project or is a package's class, so a
- * missing method has no project declaration; a supertype that can't be found,
- * or a property of that name (a function-typed field), leaves the answer
- * incomplete.
- */
-function tsMethodUpChain(cls: Node, name: string, at: UnresolvedRef, context: ResolutionContext, depth = 0): { method: Node | null; complete: boolean } {
-  const members = context.getNodesInFile(cls.filePath).filter((n) =>
-    n.name === name && n.startLine >= cls.startLine && n.endLine <= cls.endLine &&
-    n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop() === cls.name);
-  const own = members.find((n) => n.kind === 'method');
-  if (own) return { method: own, complete: true };
-  // A property of that name is what the call calls — bitwarden's `abstract
-  // getAuthStatus: (userId?: string) => Promise<…>` — but no method to link,
-  // so the answer is left to the lookups that follow.
-  if (members.some((n) => n.kind === 'property' || n.kind === 'field')) return { method: null, complete: false };
-  if (depth >= TS_BASE_WALK_DEPTH) return { method: null, complete: false };
-  const supers = tsHeadSupertypes(cls, context);
-  if (supers === null) return { method: null, complete: false };
-  let complete = true;
-  for (const written of supers) {
-    const base = tsNamedType(written, cls, at, context);
-    if (base === 'outside') continue;
-    if (!base || base.id === cls.id) {
-      complete = false;
-      continue;
-    }
-    const up = tsMethodUpChain(base, name, at, context, depth + 1);
-    if (up.method) return up;
-    if (!up.complete) complete = false;
-  }
-  return { method: null, complete };
-}
-
-/**
- * A TS/JS member call on a value of the class or interface `typeName` that
- * `file` declares: that type's method or its nearest supertype's
- * (tsMethodUpChain); null when the whole chain is known and has none, as
- * when the method is a package's: `Emitter extends lsp.Emitter` has no
- * project `fire`, whatever other `Emitter` declares one. Undefined when
- * neither `file` nor what `at`'s file imports under the name declares the
- * type, or a supertype can't be found, for the caller's own fallback. (An
- * import may rename it: bitwarden's `MessagingService` is `export {
- * MessageSender as MessagingService }`.)
- */
-function tsKnownTypeCall(
-  typeName: string,
-  file: string,
-  methodName: string,
-  ref: UnresolvedRef,
-  at: UnresolvedRef,
-  context: ResolutionContext,
-  confidence: number,
-): ResolvedRef | null | undefined {
-  let known = tsTypeDeclaredIn(file, typeName, context);
-  if (!known) {
-    const named = tsNamedType(typeName, { filePath: at.filePath, language: at.language, id: '' }, at, context);
-    if (named && named !== 'outside') known = named;
-  }
-  if (!known) return undefined;
-  const up = nmTimedT('mc-tsknown', ref, () => tsMethodUpChain(known, methodName, at, context));
-  if (up.method) return { original: ref, targetNodeId: up.method.id, confidence, resolvedBy: 'instance-method' };
-  return up.complete ? null : undefined;
-}
-
-/** `(o: T): T` as the TS extractor writes a signature: one parameter, of the type returned. */
-const TS_PASS_THROUGH_SIGNATURE = /^\(\s*[\w$]+\s*:\s*([A-Za-z_$][\w$]*)\s*\)\s*:\s*([A-Za-z_$][\w$]*)$/;
-
-/**
- * Does the TS method `fn` return its argument, as far as its declaration
- * says: one parameter, typed by a type parameter of the method's own, which
- * it returns — vscode's `_register<T extends IDisposable>(o: T): T` and
- * `DisposableStore.add`?
- */
-function tsReturnsItsArgument(fn: Node, context: ResolutionContext): boolean {
-  const sig = TS_PASS_THROUGH_SIGNATURE.exec(fn.signature?.trim() ?? '');
-  if (!sig || sig[1] !== sig[2]) return false;
-  const lines = context.getFileLines?.(fn.filePath) ?? context.readFile(fn.filePath)?.split(/\r?\n/) ?? [];
-  const head = lines.slice(fn.startLine - 1, fn.startLine + 2).join(' ');
-  const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`(?<![\\w$#])${esc(fn.name)}\\s*<\\s*(?:const\\s+)?${esc(sig[1]!)}\\b`).test(head);
-}
-
-/**
- * What a TS indexed type (`editor: IChatWidget['inputEditor']`) is: the type
- * that property is declared with in the project class or interface it
- * indexes, whether the property holds an array of it, and the file that
- * says which class of that name it is. The indexed type is the one the
- * call's file imports, when it imports one; the property's type is the one
- * the declaring file imports, or else declares (tsImportedTypeFile).
- * Undefined when the key isn't a string literal (`Parameters<typeof f>[0]`,
- * `T[K]`), the indexed type isn't the project's, or the property's type
- * isn't written there (a getter, `typeof`).
- */
-function tsIndexedPropertyType(
-  indexed: string,
-  ref: UnresolvedRef,
-  context: ResolutionContext
-): { type: string; array: boolean; file: string } | undefined {
-  const m = /^([A-Za-z_$][\w$]*)\s*\[\s*(['"])([\w$]+)\2\s*\]$/.exec(indexed);
-  if (!m) return undefined;
-  const imported = tsImportedTypeFile(m[1]!, ref, context);
-  const owners = preferCallSiteFile(context.getNodesByName(m[1]!), imported ?? ref.filePath).filter((n) =>
-    (n.kind === 'class' || n.kind === 'interface' || n.kind === 'type_alias' || n.kind === 'component') &&
-    sameLanguageFamily(n.language, ref.language));
-  for (const owner of owners) {
-    const decl = tsFieldDeclaration(owner, m[3]!, context);
-    if (!decl) continue;
-    // A type parameter of the class names no type: `Emitter<T>`'s
-    // `fire(event: T)`, which the reader takes for its `event`.
-    if (decl.valueType || tsClassTypeParameter(owner, decl.type, context)) return undefined;
-    const at = owner.filePath === ref.filePath ? ref : { ...ref, filePath: owner.filePath, language: owner.language };
-    return { type: decl.type, array: decl.array === true, file: tsImportedTypeFile(decl.type, at, context) ?? owner.filePath };
-  }
-  return undefined;
-}
-
-/** Is `name` one of the type parameters the head of the TS class or interface `cls` declares (`class Emitter<T>`)? */
-function tsClassTypeParameter(cls: Node, name: string, context: ResolutionContext): boolean {
-  const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
-  const head = lines.slice(cls.startLine - 1, cls.startLine + 2).join(' ').split('{')[0]!;
-  const open = new RegExp(`\\b${cls.name.replace(/\$/g, '\\$')}\\s*<`).exec(head);
-  if (!open) return false;
-  // The parameters between the `<` after the name and its own `>`, split
-  // at their top level: `T`, `K extends keyof T = never`.
-  let depth = 0;
-  let from = open.index + open[0].length;
-  for (let i = from; i < head.length; i++) {
-    const c = head[i];
-    if (c === '<' || c === '(' || c === '[' || c === '{') depth++;
-    else if (c === ')' || c === ']' || c === '}') depth--;
-    else if (c === '>' && head[i - 1] !== '=') {
-      if (depth === 0) return head.slice(from, i).trim().replace(/^(?:in|out|const)\s+/, '').split(/[\s=]/)[0] === name;
-      depth--;
-    } else if (c === ',' && depth === 0) {
-      if (head.slice(from, i).trim().replace(/^(?:in|out|const)\s+/, '').split(/[\s=]/)[0] === name) return true;
-      from = i + 1;
-    }
-  }
-  return false;
 }
 
 /**
  * Resolve a TS/JS `this.<field>.<method>()` call (#1496) through the field's
- * declared type, read off the ENCLOSING class's own declaration lines, or
- * a class it extends (tsFieldThroughBases): a field or constructor-parameter
- * property (`private mailer: Mailer`, `mailer?: Mailer`, `readonly mailer:
- * Mailer`) or an initializer (`mailer = new Mailer()`, `this.mailer = new
- * Mailer()`, or one a wrapper hands back: `this._register(new Mailer())`,
- * tsFieldRead). The method is then VALIDATED on that type by
- * resolveMethodOnType. Null — never a bare-name fallback — when the field is
- * not declared there or its type is external, a builtin
- * (`this.items.push()`) or not spelled out.
+ * declared type, read off the ENCLOSING class's own declaration lines:
+ * a field or constructor-parameter property (`private mailer: Mailer`,
+ * `mailer?: Mailer`, `readonly mailer: Mailer`) or an initializer
+ * (`mailer = new Mailer()`, `this.mailer = new Mailer()`). The method is then
+ * VALIDATED on that type by resolveMethodOnType. Null — never a bare-name
+ * fallback — when the field is not declared there or its type is external,
+ * a builtin (`this.items.push()`) or not spelled out.
  */
 function matchTsThisFieldCall(
   field: string,
@@ -16306,216 +15690,53 @@ function matchTsThisFieldCall(
   const owners = preferCallSiteFile(context.getNodesByName(owner), ref.filePath).filter(
     (n) => (n.kind === 'class' || n.kind === 'component') && sameLanguageFamily(n.language, ref.language)
   );
-  // The calling class declares the field, or a class it extends does: each
-  // base is the one its subclass's file names (tsFieldThroughBases), so
-  // vscode's browser `FileDialogService` finds `AbstractFileDialogService`'s
-  // `openerService`.
-  const found = nmTimedT('mc-thisfield-bases', ref, () => {
-    for (const cls of owners) {
-      if (cls.filePath !== ref.filePath) continue;
-      const hit = tsFieldThroughBases(cls, field, ref, context, 0);
-      if (hit) return hit;
+  for (const cls of owners) {
+    const decl = tsFieldDeclaration(cls, field, context);
+    if (!decl) continue;
+    if (decl.valueType) {
+      // The value's declaration may live in another file (it is imported);
+      // the call site's file is preferred when several share the name.
+      const holderName = decl.type.split('.').pop()!;
+      const holders = preferCallSiteFile(context.getNodesByName(holderName), ref.filePath).filter(
+        (n) => (n.kind === 'constant' || n.kind === 'variable') && sameLanguageFamily(n.language, ref.language)
+      );
+      for (const holder of holders) {
+        const hit = resolveObjectLiteralMember(holder, methodName, ref, context, 0.85, 'instance-method');
+        if (hit) return hit;
+      }
+      return null;
     }
-    return null;
-  });
-  if (found) return tsFieldCall(found.decl, found.cls, methodName, ref, context);
-  // Else a same-named class elsewhere may declare it, read for a calling
-  // class whose own declaration isn't (a wrapper the reader can't vouch
-  // for), but only with a type the call's file imports or declares: another
-  // app's class of that name says nothing about this one's field.
-  const namesake = nmTimedT('mc-thisfield-namesakes', ref, () => {
-    for (const cls of owners) {
-      if (cls.filePath === ref.filePath) continue;
-      const decl = tsFieldDeclaration(cls, field, context);
-      if (decl && tsTypeVisibleIn(decl.type, ref, context)) return decl;
+    // `ns.Mailer` → `Mailer`; a primitive or builtin names no project type.
+    const typeName = decl.type.split('.').pop()!;
+    if (!/^[A-Z]/.test(typeName)) return null;
+    // Two apps in one repo may each declare a `UserService`. The bare-name
+    // path this replaces broke that tie by directory proximity, so keep the
+    // same signal: among the type's declarations of the method, prefer the
+    // one closest to the call site's directory (its own app), never index
+    // order. resolveMethodOnType still answers the single-declaration and
+    // supertype cases.
+    const declared = context
+      .getNodesByName(methodName)
+      .filter(
+        (n) =>
+          n.kind === 'method' &&
+          sameLanguageFamily(n.language, ref.language) &&
+          (n.qualifiedName === `${typeName}::${methodName}` || n.qualifiedName.endsWith(`::${typeName}::${methodName}`))
+      );
+    if (declared.length > 1) {
+      const callDirs = ref.filePath.split('/').slice(0, -1);
+      const shared = (fp: string) => {
+        const dirs = fp.split('/').slice(0, -1);
+        let i = 0;
+        while (i < dirs.length && i < callDirs.length && dirs[i] === callDirs[i]) i++;
+        return i;
+      };
+      const nearest = [...declared].sort((a, b) => shared(b.filePath) - shared(a.filePath) || a.filePath.localeCompare(b.filePath))[0]!;
+      return { original: ref, targetNodeId: nearest.id, confidence: 0.85, resolvedBy: 'instance-method' };
     }
-    return null;
-  });
-  return namesake ? tsFieldCall(namesake, null, methodName, ref, context) : null;
-}
-
-/** A TS field's declared type, as tsFieldDeclaration reads it. */
-type TsFieldRead = NonNullable<ReturnType<typeof tsFieldDeclaration>>;
-
-/**
- * `field`'s declaration on `cls` or on the classes it extends, nearest
- * first, with the class it is written in: each base is the class its
- * subclass's file names (tsNamedClass), and the field's type is the class
- * that class's file imports or declares.
- */
-function tsFieldThroughBases(
-  cls: Node,
-  field: string,
-  ref: UnresolvedRef,
-  context: ResolutionContext,
-  depth: number,
-): { decl: TsFieldRead; cls: Node } | null {
-  const decl = tsFieldDeclaration(cls, field, context);
-  if (decl) return { decl, cls };
-  if (depth >= TS_BASE_WALK_DEPTH) return null;
-  for (const name of declaredSupertypes(cls, context)) {
-    const base = tsNamedClass(name, cls, ref, context);
-    if (!base || base.id === cls.id) continue;
-    const found = tsFieldThroughBases(base, field, ref, context, depth + 1);
-    if (found) return found;
+    return resolveMethodOnType(typeName, methodName, ref, context, 0.85, 'instance-method');
   }
   return null;
-}
-
-/** Per-context memo: `<file>\0<name>` → tsNamedClass's answer. */
-const TS_NAMED_CLASSES = new WeakMap<ResolutionContext, Map<string, Node | null>>();
-
-/**
- * The class `name` names in `from`'s file: the one that file imports under
- * it, followed through re-exports and aliases (`import { EditorPart as
- * BaseEditorPart }`), or else a class the file declares.
- */
-function tsNamedClass(name: string, from: Node, ref: UnresolvedRef, context: ResolutionContext): Node | null {
-  let memo = TS_NAMED_CLASSES.get(context);
-  if (!memo) {
-    memo = new Map();
-    TS_NAMED_CLASSES.set(context, memo);
-  }
-  const key = from.filePath + '\0' + name;
-  const hit = memo.get(key);
-  if (hit !== undefined) return hit;
-  let found: Node | null = null;
-  if (context.getImportMappings?.(from.filePath, from.language)?.some((i) => i.localName === name)) {
-    const imported = context.resolveImport?.({ ...ref, filePath: from.filePath, language: from.language, referenceName: name, referenceKind: 'references' });
-    const node = imported ? context.getNodeById?.(imported.targetNodeId) : undefined;
-    if (node && (node.kind === 'class' || node.kind === 'component')) found = node;
-  } else {
-    found = context.getNodesInFile(from.filePath).find((n) => n.kind === 'class' && n.name === name) ?? null;
-  }
-  memo.set(key, found);
-  return found;
-}
-
-/** Per-context memo: `<package>\0<type name>` → tsOutsideTypeDeclaration's ambient file. */
-const TS_AMBIENT_MODULE_FILES = new WeakMap<ResolutionContext, Map<string, string | null>>();
-
-/**
- * For a TS/JS type the file `at` names imports under the head of `written`
- * from a package outside the project: the project file that declares that
- * package with a `typeName` in it (`declare module 'pkg' { … }`, as
- * vscode's `src/typings/copilot-api.d.ts` and react-native's Flow
- * `flow-typed/npm/*.js` libdefs do; a `node:` import is its bare module's),
- * or null when none does. Undefined when the type isn't imported from
- * outside the project.
- */
-function tsOutsideTypeDeclaration(written: string, typeName: string, at: UnresolvedRef, context: ResolutionContext): string | null | undefined {
-  const head = /^[A-Za-z_$][\w$]*/.exec(written.trim())?.[0];
-  if (!head) return undefined;
-  const binding = context.getImportMappings?.(at.filePath, at.language)?.find((m) => m.localName === head);
-  if (!binding || context.isOutOfRepoImport?.(binding.source, at.filePath, at.language) !== true) return undefined;
-  let memo = TS_AMBIENT_MODULE_FILES.get(context);
-  if (!memo) {
-    memo = new Map();
-    TS_AMBIENT_MODULE_FILES.set(context, memo);
-  }
-  const key = binding.source + '\0' + typeName;
-  let file = memo.get(key);
-  if (file === undefined) {
-    file = null;
-    const pkg = binding.source.replace(/^node:/, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const declares = new RegExp(`\\bdeclare\\s+module\\s+(['"])(?:node:)?${pkg}\\1`);
-    for (const n of context.getNodesByName(typeName)) {
-      if (!sameLanguageFamily(n.language, at.language)) continue;
-      if (declares.test(context.readFile(n.filePath) ?? '')) {
-        file = n.filePath;
-        break;
-      }
-    }
-    memo.set(key, file);
-  }
-  return file;
-}
-
-/** Does the call's file import a type named `type` from the project, or declare one? */
-function tsTypeVisibleIn(type: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
-  if (tsImportedTypeFile(type, ref, context) !== undefined) return true;
-  const head = type.split('.')[0]!;
-  return context.getNodesInFile(ref.filePath).some((n) =>
-    n.name === head && (n.kind === 'class' || n.kind === 'interface' || n.kind === 'type_alias' || n.kind === 'constant' || n.kind === 'variable'));
-}
-
-/**
- * Resolve `this.<field>.<method>()` through a declaration of the field on
- * `declaring`, the calling class or a base, or on a same-named class
- * elsewhere (null), whose type the call's file names.
- */
-function tsFieldCall(
-  decl: TsFieldRead,
-  declaring: Node | null,
-  methodName: string,
-  ref: UnresolvedRef,
-  context: ResolutionContext,
-): ResolvedRef | null {
-  if (decl.valueType) {
-    // The value's declaration may live in another file (it is imported);
-    // the call site's file is preferred when several share the name.
-    const holderName = decl.type.split('.').pop()!;
-    const holders = preferCallSiteFile(context.getNodesByName(holderName), ref.filePath).filter(
-      (n) => (n.kind === 'constant' || n.kind === 'variable') && sameLanguageFamily(n.language, ref.language)
-    );
-    for (const holder of holders) {
-      const hit = resolveObjectLiteralMember(holder, methodName, ref, context, 0.85, 'instance-method');
-      if (hit) return hit;
-    }
-    return null;
-  }
-  // `ns.Mailer` → `Mailer`; a primitive or builtin names no project type.
-  const typeName = decl.type.split('.').pop()!;
-  if (!/^[A-Z]/.test(typeName)) return null;
-  // The file the field is written in names its type. Two apps in one repo
-  // may each declare a `UserService`: that file imports the one the field
-  // holds, or declares it, so that one's method is the call's. One it
-  // imports from a package outside the project, which no project file
-  // declares (as `src/typings/*.d.ts` may), has no project method:
-  // microsoft-authentication's `TelemetryReporter` from
-  // `@vscode/extension-telemetry` reached another extension's interface of
-  // that name. Without an import, the bare-name path this replaces broke
-  // the tie by directory proximity, so keep the same signal: among the
-  // type's declarations of the method, prefer the one closest to the call
-  // site's directory (its own app), never index order. resolveMethodOnType
-  // still answers the single-declaration and supertype cases.
-  const at = !declaring || declaring.filePath === ref.filePath
-    ? ref
-    : { ...ref, filePath: declaring.filePath, language: declaring.language };
-  let imported = tsImportedTypeFile(decl.type, at, context);
-  if (imported === undefined) {
-    const outside = nmTimedT('mc-tsoutside', ref, () => tsOutsideTypeDeclaration(decl.type, typeName, at, context));
-    if (outside === null) return null;
-    imported = outside ?? (at === ref ? undefined : at.filePath);
-  }
-  // That class decides, through its own supertypes: a same-named class
-  // elsewhere answered when it didn't declare the method itself, as vscode's
-  // `Storage`, which inherits `dispose` from `Disposable`, reached a test
-  // fixture's `Disposable`.
-  const known = tsKnownTypeCall(typeName, imported ?? at.filePath, methodName, ref, at, context, 0.85);
-  if (known !== undefined) return known;
-  const declared = context
-    .getNodesByName(methodName)
-    .filter(
-      (n) =>
-        n.kind === 'method' &&
-        sameLanguageFamily(n.language, ref.language) &&
-        (n.qualifiedName === `${typeName}::${methodName}` || n.qualifiedName.endsWith(`::${typeName}::${methodName}`))
-    );
-  if (declared.length > 1) {
-    const own = imported !== undefined ? declared.find((n) => n.filePath === imported) : undefined;
-    if (own) return { original: ref, targetNodeId: own.id, confidence: 0.85, resolvedBy: 'instance-method' };
-    const callDirs = ref.filePath.split('/').slice(0, -1);
-    const shared = (fp: string) => {
-      const dirs = fp.split('/').slice(0, -1);
-      let i = 0;
-      while (i < dirs.length && i < callDirs.length && dirs[i] === callDirs[i]) i++;
-      return i;
-    };
-    const nearest = [...declared].sort((a, b) => shared(b.filePath) - shared(a.filePath) || a.filePath.localeCompare(b.filePath))[0]!;
-    return { original: ref, targetNodeId: nearest.id, confidence: 0.85, resolvedBy: 'instance-method' };
-  }
-  return resolveMethodOnType(typeName, methodName, ref, context, 0.85, 'instance-method', imported);
 }
 
 /**
